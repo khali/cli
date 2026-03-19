@@ -63,6 +63,71 @@ TIPS:
   Filename is inferred from the local path unless --name is given.",
                 ),
         );
+        // --- soul-codes helpers ---
+        // Add these subcommands inside inject_commands(), before the closing `cmd`
+
+        cmd = cmd.subcommand(
+            Command::new("+download")
+                .about("[Helper] Download a file by ID")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .help("Drive file ID to download")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .arg(
+                    Arg::new("dest")
+                        .long("dest")
+                        .help("Destination path (default: /tmp/{fileId})")
+                        .value_name("PATH"),
+                )
+                .after_help(
+                    "\
+EXAMPLES:
+  gws drive +download --file 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
+  gws drive +download --file 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms --dest ./report.pdf
+
+TIPS:
+  Downloads the file content (binary export).
+  For Google Docs/Sheets/Slides, use the export endpoint instead.",
+                ),
+        );
+
+        cmd = cmd.subcommand(
+            Command::new("+revision-get")
+                .about("[Helper] Download a specific revision of a file")
+                .arg(
+                    Arg::new("file")
+                        .long("file")
+                        .help("Drive file ID")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .arg(
+                    Arg::new("revision")
+                        .long("revision")
+                        .help("Revision ID to download")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .arg(
+                    Arg::new("dest")
+                        .long("dest")
+                        .help("Destination path (default: /tmp/{fileId}-{revisionId})")
+                        .value_name("PATH"),
+                )
+                .after_help(
+                    "\
+EXAMPLES:
+  gws drive +revision-get --file FILE_ID --revision REV_ID
+  gws drive +revision-get --file FILE_ID --revision REV_ID --dest ./old-version.pdf
+
+TIPS:
+  Use `gws drive revisions list --fileId FILE_ID` to find revision IDs.
+  Not all file types support revision downloads.",
+                ),
+        );
         cmd
     }
 
@@ -125,6 +190,18 @@ TIPS:
 
                 return Ok(true);
             }
+            // Add these blocks inside handle(), before the final `Ok(false)`
+
+            if let Some(matches) = matches.subcommand_matches("+download") {
+                handle_download(matches).await?;
+                return Ok(true);
+            }
+
+            if let Some(matches) = matches.subcommand_matches("+revision-get") {
+                handle_revision_get(matches).await?;
+                return Ok(true);
+            }
+
             Ok(false)
         })
     }
@@ -152,6 +229,145 @@ fn build_metadata(filename: &str, parent_id: Option<&str>) -> Value {
     }
 
     metadata
+}
+
+// Add these after the existing `build_metadata` function, before `#[cfg(test)]`
+
+const DRIVE_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+
+async fn handle_download(matches: &ArgMatches) -> Result<(), GwsError> {
+    let file_id = matches.get_one::<String>("file").unwrap();
+    let default_dest = format!("/tmp/{file_id}");
+    let dest_path = matches
+        .get_one::<String>("dest")
+        .map(|s| s.as_str())
+        .unwrap_or(&default_dest);
+
+    let token = auth::get_token(&[DRIVE_READONLY_SCOPE])
+        .await
+        .map_err(|e| GwsError::Auth(format!("Drive auth failed: {e}")))?;
+
+    let client = crate::client::build_client()?;
+
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+        crate::validate::encode_path_segment(file_id)
+    );
+
+    let resp = crate::client::send_with_retry(|| client.get(&url).bearer_auth(&token))
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to download file: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "(error body unreadable)".to_string());
+        return Err(GwsError::Api {
+            code: status,
+            message: format!("Failed to download file {file_id}: {body}"),
+            reason: "downloadFailed".to_string(),
+            enable_url: None,
+        });
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Read error: {e}")))?;
+
+    let mut file = tokio::fs::File::create(dest_path)
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Cannot create file {dest_path}: {e}")))?;
+
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Write error: {e}")))?;
+
+    let output = json!({
+        "downloaded": file_id,
+        "dest": dest_path,
+        "bytes": bytes.len(),
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("JSON serialization error: {e}")))?
+    );
+
+    Ok(())
+}
+
+async fn handle_revision_get(matches: &ArgMatches) -> Result<(), GwsError> {
+    let file_id = matches.get_one::<String>("file").unwrap();
+    let revision_id = matches.get_one::<String>("revision").unwrap();
+    let default_dest = format!("/tmp/{file_id}-{revision_id}");
+    let dest_path = matches
+        .get_one::<String>("dest")
+        .map(|s| s.as_str())
+        .unwrap_or(&default_dest);
+
+    let token = auth::get_token(&[DRIVE_READONLY_SCOPE])
+        .await
+        .map_err(|e| GwsError::Auth(format!("Drive auth failed: {e}")))?;
+
+    let client = crate::client::build_client()?;
+
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}/revisions/{}?alt=media",
+        crate::validate::encode_path_segment(file_id),
+        crate::validate::encode_path_segment(revision_id)
+    );
+
+    let resp = crate::client::send_with_retry(|| client.get(&url).bearer_auth(&token))
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Failed to download revision: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "(error body unreadable)".to_string());
+        return Err(GwsError::Api {
+            code: status,
+            message: format!("Failed to download revision {revision_id} of file {file_id}: {body}"),
+            reason: "downloadFailed".to_string(),
+            enable_url: None,
+        });
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Read error: {e}")))?;
+
+    let mut file = tokio::fs::File::create(dest_path)
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Cannot create file {dest_path}: {e}")))?;
+
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| GwsError::Other(anyhow::anyhow!("Write error: {e}")))?;
+
+    let output = json!({
+        "downloaded": file_id,
+        "revision": revision_id,
+        "dest": dest_path,
+        "bytes": bytes.len(),
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| GwsError::Other(anyhow::anyhow!("JSON serialization error: {e}")))?
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -192,5 +408,23 @@ mod tests {
         let meta = build_metadata("file.txt", Some("folder123"));
         assert_eq!(meta["name"], "file.txt");
         assert_eq!(meta["parents"][0], "folder123");
+    }
+
+    // --- soul-codes helper tests ---
+    // Add these inside the existing `#[cfg(test)] mod tests { ... }` block
+
+    #[test]
+    fn test_download_default_dest() {
+        let file_id = "abc123";
+        let default_dest = format!("/tmp/{file_id}");
+        assert_eq!(default_dest, "/tmp/abc123");
+    }
+
+    #[test]
+    fn test_revision_get_default_dest() {
+        let file_id = "abc123";
+        let revision_id = "rev456";
+        let default_dest = format!("/tmp/{file_id}-{revision_id}");
+        assert_eq!(default_dest, "/tmp/abc123-rev456");
     }
 }

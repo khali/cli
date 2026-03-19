@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::Helper;
+pub mod draft;
 pub mod forward;
 pub mod read;
 pub mod reply;
@@ -20,6 +21,7 @@ pub mod send;
 pub mod triage;
 pub mod watch;
 
+use draft::{handle_draft_get, handle_draft_update};
 use forward::handle_forward;
 use read::handle_read;
 use reply::handle_reply;
@@ -1497,6 +1499,71 @@ TIPS:
                 ),
         );
 
+        // Add these subcommands inside inject_commands(), before the closing `cmd`
+
+        cmd = cmd.subcommand(
+            Command::new("+draft-get")
+                .about("[Helper] Get a draft message with its content")
+                .arg(
+                    Arg::new("draft")
+                        .long("draft")
+                        .help("Gmail draft ID")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .after_help(
+                    "\
+EXAMPLES:
+  gws gmail +draft-get --draft r123456789
+  gws gmail +draft-get --draft r123456789 | jq '.body'
+
+TIPS:
+  Returns the draft ID, to, subject, and decoded body text.
+  Use `gws gmail users.drafts list` to find draft IDs.",
+                ),
+        );
+
+        cmd = cmd.subcommand(
+            Command::new("+draft-update")
+                .about("[Helper] Update an existing draft with new content")
+                .arg(
+                    Arg::new("draft")
+                        .long("draft")
+                        .help("Gmail draft ID to update")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .arg(
+                    Arg::new("to")
+                        .long("to")
+                        .help("Recipient email address")
+                        .required(true)
+                        .value_name("EMAIL"),
+                )
+                .arg(
+                    Arg::new("subject")
+                        .long("subject")
+                        .help("Email subject")
+                        .required(true)
+                        .value_name("SUBJECT"),
+                )
+                .arg(
+                    Arg::new("body")
+                        .long("body")
+                        .help("Email body (plain text)")
+                        .required(true)
+                        .value_name("TEXT"),
+                )
+                .after_help(
+                    "\
+EXAMPLES:
+  gws gmail +draft-update --draft r123 --to alice@example.com --subject 'Hello' --body 'Hi Alice!'
+
+TIPS:
+  Replaces the entire draft content with the new message.
+  Use +draft-get first to read existing content if you need to preserve parts.",
+                ),
+        );
         cmd
     }
 
@@ -1539,6 +1606,18 @@ TIPS:
 
             if let Some(matches) = matches.subcommand_matches("+watch") {
                 handle_watch(matches, sanitize_config).await?;
+                return Ok(true);
+            }
+
+            // Add these blocks inside handle(), before the final `Ok(false)`
+
+            if let Some(matches) = matches.subcommand_matches("+draft-get") {
+                handle_draft_get(matches).await?;
+                return Ok(true);
+            }
+
+            if let Some(matches) = matches.subcommand_matches("+draft-update") {
+                handle_draft_update(matches).await?;
                 return Ok(true);
             }
 
