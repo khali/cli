@@ -71,7 +71,7 @@ TIPS:
                         .long("limit")
                         .help("Maximum number of revisions to return (default: 20)")
                         .value_name("N")
-                        .value_parser(clap::value_parser!(u32)),
+                        .value_parser(clap::value_parser!(u32).range(1..=1000)),
                 )
                 .after_help(
                     "\
@@ -610,7 +610,7 @@ async fn handle_revisions(matches: &ArgMatches) -> Result<(), GwsError> {
             .text()
             .await
             .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-        return Err(build_api_error(status.as_u16(), &body));
+        return Err(GwsError::from_api_response(status.as_u16(), &body));
     }
 
     let value: Value = resp
@@ -624,42 +624,6 @@ async fn handle_revisions(matches: &ArgMatches) -> Result<(), GwsError> {
         .unwrap_or_default();
     println!("{}", crate::formatter::format_value(&value, &fmt));
     Ok(())
-}
-
-/// Build a GwsError::Api from an HTTP error response, parsing the Google
-/// JSON error format when available.
-fn build_api_error(status: u16, body: &str) -> GwsError {
-    let err_json: Option<Value> = serde_json::from_str(body).ok();
-    let err_obj = err_json.as_ref().and_then(|v| v.get("error"));
-    let message = err_obj
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or(body)
-        .to_string();
-    let reason = err_obj
-        .and_then(|e| e.get("errors"))
-        .and_then(|e| e.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|e| e.get("reason"))
-        .and_then(|r| r.as_str())
-        .or_else(|| {
-            err_obj
-                .and_then(|e| e.get("reason"))
-                .and_then(|r| r.as_str())
-        })
-        .unwrap_or("unknown")
-        .to_string();
-    let enable_url = if reason == "accessNotConfigured" {
-        crate::executor::extract_enable_url(&message)
-    } else {
-        None
-    };
-    GwsError::Api {
-        code: status,
-        message,
-        reason,
-        enable_url,
-    }
 }
 
 /// Fetch a Google Doc by ID. Returns the parsed JSON body.
