@@ -548,46 +548,69 @@ TIPS:
 }
 
 async fn handle_revisions(matches: &ArgMatches) -> Result<(), GwsError> {
+    const REVISION_FIELDS: &str =
+        "revisions(id,modifiedTime,lastModifyingUser/displayName,keepForever,size)";
+
     let document_id = matches.get_one::<String>("document").unwrap();
     let limit = matches.get_one::<u32>("limit").copied().unwrap_or(20);
+    let dry_run = matches.get_flag("dry-run");
 
     let scope = "https://www.googleapis.com/auth/drive.readonly";
-    let token = auth::get_token(&[scope]).await.map_err(|e| {
-        GwsError::Auth(format!(
-            "Docs auth failed: {}",
-            crate::output::sanitize_for_terminal(&e.to_string())
-        ))
-    })?;
+    let token = if dry_run {
+        None
+    } else {
+        Some(auth::get_token(&[scope]).await.map_err(|e| {
+            GwsError::Auth(format!(
+                "Docs auth failed: {}",
+                crate::output::sanitize_for_terminal(&e.to_string())
+            ))
+        })?)
+    };
+
+    let limit_str = limit.to_string();
+    let encoded_id =
+        percent_encoding::utf8_percent_encode(document_id, percent_encoding::NON_ALPHANUMERIC);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}/revisions",
+        encoded_id
+    );
+
+    if dry_run {
+        let dry_run_info = json!({
+            "dry_run": true,
+            "url": url,
+            "method": "GET",
+            "query_params": {
+                "fields": REVISION_FIELDS,
+                "pageSize": limit_str,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&dry_run_info).unwrap_or_default()
+        );
+        return Ok(());
+    }
 
     let client = crate::client::build_client()?;
-    let limit_str = limit.to_string();
-
     let resp = client
-        .get(format!(
-            "https://www.googleapis.com/drive/v3/files/{}/revisions",
-            document_id
-        ))
+        .get(url)
         .query(&[
-            (
-                "fields",
-                "revisions(id,modifiedTime,lastModifyingUser/displayName,keepForever,size)",
-            ),
+            ("fields", REVISION_FIELDS),
             ("pageSize", limit_str.as_str()),
         ])
-        .bearer_auth(&token)
+        .bearer_auth(token.unwrap()) // safe: dry_run path already returned above
         .send()
         .await
         .map_err(|e| GwsError::Other(anyhow::anyhow!("HTTP request failed: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(GwsError::Api {
-            code: status.as_u16(),
-            message: body,
-            reason: "revisions_request_failed".to_string(),
-            enable_url: None,
-        });
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+        return Err(build_api_error(status.as_u16(), &body));
     }
 
     let value: Value = resp
@@ -603,7 +626,41 @@ async fn handle_revisions(matches: &ArgMatches) -> Result<(), GwsError> {
     Ok(())
 }
 
-// Add these after the existing build_write_request function, before #[cfg(test)]:
+/// Build a GwsError::Api from an HTTP error response, parsing the Google
+/// JSON error format when available.
+fn build_api_error(status: u16, body: &str) -> GwsError {
+    let err_json: Option<Value> = serde_json::from_str(body).ok();
+    let err_obj = err_json.as_ref().and_then(|v| v.get("error"));
+    let message = err_obj
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or(body)
+        .to_string();
+    let reason = err_obj
+        .and_then(|e| e.get("errors"))
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|e| e.get("reason"))
+        .and_then(|r| r.as_str())
+        .or_else(|| {
+            err_obj
+                .and_then(|e| e.get("reason"))
+                .and_then(|r| r.as_str())
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let enable_url = if reason == "accessNotConfigured" {
+        crate::executor::extract_enable_url(&message)
+    } else {
+        None
+    };
+    GwsError::Api {
+        code: status,
+        message,
+        reason,
+        enable_url,
+    }
+}
 
 /// Fetch a Google Doc by ID. Returns the parsed JSON body.
 async fn fetch_document(document_id: &str) -> Result<Value, GwsError> {
