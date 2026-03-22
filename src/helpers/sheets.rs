@@ -16,6 +16,8 @@ use super::Helper;
 use crate::auth;
 use crate::error::GwsError;
 use crate::executor;
+use anyhow::anyhow;
+use chrono::Utc;
 use clap::{Arg, ArgMatches, Command};
 use serde_json::json;
 use std::future::Future;
@@ -91,6 +93,37 @@ TIPS:
                 ),
         );
 
+        cmd = cmd.subcommand(
+            Command::new("+version-tag")
+                .about("[Helper] Tag the current version of a spreadsheet in its Working Notes tab")
+                .arg(
+                    Arg::new("spreadsheet")
+                        .long("spreadsheet")
+                        .help("Spreadsheet ID")
+                        .required(true)
+                        .value_name("ID"),
+                )
+                .arg(
+                    Arg::new("label")
+                        .long("label")
+                        .help("Version label (e.g. 'v1.0 pre-deployment')")
+                        .required(true)
+                        .value_name("LABEL"),
+                )
+                .after_help(
+                    "\
+EXAMPLES:
+  gws sheets +version-tag --spreadsheet ID --label \"v1.0 pre-deployment\"
+  gws sheets +version-tag --spreadsheet ID --label \"v2.3 after formula restoration\"
+
+TIPS:
+  Appends a row to the VERSION HISTORY table in the Working Notes tab.
+  Columns written: label | date (UTC) | Drive revision ID | timestamp.
+  The Drive revision ID lets you identify the exact snapshot in Google Drive
+  version history (File > Version history > See version history).",
+                ),
+        );
+
         cmd
     }
 
@@ -146,6 +179,73 @@ TIPS:
                 )
                 .await?;
 
+                return Ok(true);
+            }
+
+            if let Some(matches) = matches.subcommand_matches("+version-tag") {
+                let spreadsheet_id = matches.get_one::<String>("spreadsheet").unwrap();
+                let label = matches.get_one::<String>("label").unwrap();
+
+                let scopes = vec![
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.readonly",
+                ];
+                let (token, _auth_method) = match auth::get_token(&scopes).await {
+                    Ok(t) => (t, executor::AuthMethod::OAuth),
+                    Err(e) => return Err(GwsError::Auth(format!("Auth failed: {e}"))),
+                };
+
+                // Fetch the latest Drive revision ID for this spreadsheet
+                let revision_id = fetch_latest_revision_id(spreadsheet_id, &token).await?;
+
+                let date_str = Utc::now().format("%Y-%m-%d").to_string();
+                let timestamp_str = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+                // Append a row to the VERSION HISTORY table in Working Notes
+                let spreadsheets_res = doc.resources.get("spreadsheets").ok_or_else(|| {
+                    GwsError::Discovery("Resource 'spreadsheets' not found".to_string())
+                })?;
+                let values_res = spreadsheets_res.resources.get("values").ok_or_else(|| {
+                    GwsError::Discovery("Resource 'spreadsheets.values' not found".to_string())
+                })?;
+                let append_method = values_res.methods.get("append").ok_or_else(|| {
+                    GwsError::Discovery("Method 'spreadsheets.values.append' not found".to_string())
+                })?;
+
+                let params = json!({
+                    "spreadsheetId": spreadsheet_id,
+                    "range": "Working Notes!A:D",
+                    "valueInputOption": "USER_ENTERED",
+                    "insertDataOption": "INSERT_ROWS"
+                });
+                let body = json!({
+                    "values": [[label, date_str, revision_id, timestamp_str]]
+                });
+
+                executor::execute_method(
+                    doc,
+                    append_method,
+                    Some(&params.to_string()),
+                    Some(&body.to_string()),
+                    Some(&token),
+                    executor::AuthMethod::OAuth,
+                    None,
+                    None,
+                    matches.get_flag("dry-run"),
+                    &executor::PaginationConfig::default(),
+                    None,
+                    &crate::helpers::modelarmor::SanitizeMode::Warn,
+                    &crate::formatter::OutputFormat::default(),
+                    false,
+                )
+                .await?;
+
+                eprintln!(
+                    "✓ Version tagged: {label} | date: {date_utc} | revision: {rev}",
+                    label = label,
+                    date_utc = Utc::now().format("%Y-%m-%d"),
+                    rev = revision_id
+                );
                 return Ok(true);
             }
 
@@ -293,6 +393,43 @@ pub fn parse_append_args(matches: &ArgMatches) -> AppendConfig {
         spreadsheet_id: matches.get_one::<String>("spreadsheet").unwrap().clone(),
         values,
     }
+}
+
+/// Fetches the latest Drive revision ID for a file.
+///
+/// Returns the revision `id` string of the most recent revision,
+/// or `"unknown"` if the API call fails or returns no revisions.
+async fn fetch_latest_revision_id(file_id: &str, token: &str) -> Result<String, GwsError> {
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{file_id}/revisions?pageSize=100&fields=revisions(id,modifiedTime)"
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| GwsError::Other(anyhow!("Drive revisions request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        // Non-fatal — return unknown rather than aborting the version tag
+        return Ok("unknown".to_string());
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| GwsError::Other(anyhow!("Drive revisions parse failed: {e}")))?;
+
+    let revision_id = body["revisions"]
+        .as_array()
+        .and_then(|arr| arr.last())
+        .and_then(|rev| rev["id"].as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(revision_id)
 }
 
 /// Configuration for reading values from a spreadsheet.
@@ -467,5 +604,30 @@ mod tests {
         let subcommands: Vec<_> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         assert!(subcommands.contains(&"+append"));
         assert!(subcommands.contains(&"+read"));
+        assert!(subcommands.contains(&"+version-tag"));
+    }
+
+    #[test]
+    fn test_version_tag_args_parsed() {
+        let cmd = Command::new("test")
+            .arg(Arg::new("spreadsheet").long("spreadsheet"))
+            .arg(Arg::new("label").long("label"));
+        let matches = cmd
+            .try_get_matches_from([
+                "test",
+                "--spreadsheet",
+                "SHEET123",
+                "--label",
+                "v1.0 pre-deployment",
+            ])
+            .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("spreadsheet").unwrap(),
+            "SHEET123"
+        );
+        assert_eq!(
+            matches.get_one::<String>("label").unwrap(),
+            "v1.0 pre-deployment"
+        );
     }
 }
